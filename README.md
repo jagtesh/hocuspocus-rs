@@ -18,13 +18,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hocuspocus-rs = "0.1.0"
+# For most users, 'server' is required to get the built-in sync server logic.
+hocuspocus-rs = { version = "0.1.0", features = ["server"] }
 ```
 
 ### Feature Flags
 
-- `server`: Enables `axum` integration and built-in WebSocket handlers.
-- `sqlite`: Enables `rusqlite` persistence layer.
+- **`server` (Recommended)**: Enables `axum` integration and provides built-in WebSocket handlers for synchronization.
+- **`sqlite`**: Enables `rusqlite` persistence layer to store document updates.
 
 ## Client Compatibility
 
@@ -39,6 +40,8 @@ import * as Y from 'yjs'
 const ydoc = new Y.Doc()
 
 const provider = new HocuspocusProvider({
+  // The 'url' should point to your Rust server's sync endpoint.
+  // The default Axum router maps this to '/sync/:room_name'.
   url: 'ws://127.0.0.1:1234/sync',
   name: 'my-document-name',
   document: ydoc,
@@ -47,59 +50,58 @@ const provider = new HocuspocusProvider({
 
 ## Usage
 
-### Using with Axum (and SQLite)
+### Using with Axum
 
-Enable the `server` and `sqlite` features in your `Cargo.toml`.
+The `server` feature provides a `create_router` function that returns an `axum::Router`. You can mount this router at any path you choose.
 
 ```rust
 use hocuspocus_rs::{AppState, Database, create_router};
 use std::sync::Arc;
+use axum::Router;
 
 #[tokio::main]
 async fn main() {
-    // 1. Initialize database (requires 'sqlite' feature)
+    // 1. (Optional) Initialize database if using 'sqlite' feature
     let db = Database::init("sync.db").expect("Failed to init DB");
     
-    // 2. Create shared state (AppState structure depends on feature flags)
+    // 2. Create shared state
+    // If 'sqlite' is enabled, pass the db. Otherwise use AppState::new().
     let state = Arc::new(AppState::new(db));
     
-    // 3. Create router (requires 'server' feature)
-    let app = create_router(state);
+    // 3. Create the sync router
+    // This provides routes for /sync and /sync/:room_name by default.
+    let hocuspocus_router = create_router(state);
     
-    // 4. Run the server
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await.unwrap();
+    // 4. Nest it into your main application router at any endpoint
+    let app = Router::new()
+        .nest("/", hocuspocus_router); // Result: ws://localhost:1234/sync/...
+    
+    // 5. Run the server on your desired port
+    let port = "127.0.0.1:1234";
+    let listener = tokio::net::TcpListener::bind(port).await.unwrap();
+    println!("Hocuspocus server listening on {}", port);
     axum::serve(listener, app).await.unwrap();
 }
 ```
 
-### Using with Axum (In-Memory / No SQLite)
+### Configuration Details
 
-Enable only the `server` feature.
+- **Endpoint**: The built-in router handles `GET /sync` (for multiplexed connections) and `GET /sync/:room_name` (for room-specific connections). You can change the base path by using `.nest("/my-custom-path", hocuspocus_router)` in your Axum setup.
+- **Port**: Control the port by changing the address passed to `TcpListener::bind`.
+- **Database**: If the `sqlite` feature is enabled, `AppState::new(db)` accepts a `Database` instance. If disabled, `AppState::new()` takes no arguments.
 
-```rust
-use hocuspocus_rs::{AppState, create_router};
-use std::sync::Arc;
+### Manual Integration (No Axum)
 
-#[tokio::main]
-async fn main() {
-    let state = Arc::new(AppState::new());
-    let app = create_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:1234").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
-}
-```
-
-### Manual Integration
-
-You can also use the `DocHandler` directly if you're using a different web framework:
+If you're using a different web framework, you can use the `DocHandler` directly:
 
 ```rust
 use hocuspocus_rs::DocHandler;
 
 async fn my_websocket_handler(data: &[u8], handler: &DocHandler) {
+    // This will parse Hocuspocus V2 messages and return responses
     let responses = handler.handle_message(data).await;
     for resp in responses {
-        // Send resp back to client over WebSocket
+        // Send 'resp' back to client over your WebSocket connection
     }
 }
 ```
