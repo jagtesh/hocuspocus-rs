@@ -37,4 +37,4 @@ server = ["axum"]
 sqlite = ["rusqlite"]
 
 [dev-dependencies]
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

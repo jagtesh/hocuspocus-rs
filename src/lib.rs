@@ -65,9 +65,6 @@ impl AppState {
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.clone();
-                    // Use tokio::task::block_in_place for sync context if needed,
-                    // but here we are in a dashmap closure.
-                    // We'll use a simpler approach for the library.
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
                             .block_on(async { Arc::new(DocHandler::new(name, db).await) })

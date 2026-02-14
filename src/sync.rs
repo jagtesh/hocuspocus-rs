@@ -17,9 +17,8 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 #[cfg(feature = "sqlite")]
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 #[cfg(feature = "sqlite")]
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use yrs::encoding::read::Read;
 use yrs::encoding::write::Write;
 use yrs::updates::decoder::{Decode, DecoderV1};
@@ -743,5 +742,19 @@ mod tests {
         // Empty message should return empty responses
         let responses = handler.handle_message(&[]).await;
         assert!(responses.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "sqlite"))]
+    async fn test_doc_handler_no_sqlite() {
+        let handler = DocHandler::new("test-room-no-db".to_string()).await;
+        assert_eq!(handler.doc_name, "test-room-no-db");
+        
+        // Basic sync generation should still work
+        let messages = handler.generate_initial_sync();
+        assert_eq!(messages.len(), 1);
+        
+        let (_, name) = DocHandler::read_and_skip_doc_name(&messages[0]).unwrap();
+        assert_eq!(name, "test-room-no-db");
     }
 }
