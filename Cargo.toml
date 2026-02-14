@@ -1,0 +1,40 @@
+[package]
+name = "hocuspocus-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jagtesh Chadha"]
+description = "A Rust implementation of the Hocuspocus protocol (Yjs over WebSockets)"
+license = "BSD-3-Clause"
+repository = "https://github.com/jagtesh/hocuspocus-rs"
+readme = "README.md"
+keywords = ["yjs", "crdt", "hocuspocus", "sync", "websocket"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+# Sync & CRDTs
+yrs = "0.19"
+dashmap = "5.5"
+futures-util = "0.3"
+
+# Async Runtime
+tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "signal", "fs", "sync", "time"] }
+
+# Web Framework (Optional but common)
+axum = { version = "0.7", features = ["ws"], optional = true }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+
+# Logging
+tracing = "0.1"
+
+# Utilities
+directories = "5.0"
+
+[features]
+default = []
+server = ["axum"]
+sqlite = ["rusqlite"]
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
