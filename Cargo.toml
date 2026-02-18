@@ -1,6 +1,6 @@
 [package]
 name = "hocuspocus-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Jagtesh Chadha"]
 description = "A Rust implementation of the Hocuspocus protocol (Yjs over WebSockets)"

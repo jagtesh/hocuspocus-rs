@@ -19,13 +19,24 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 # For most users, 'server' is required to get the built-in sync server logic.
-hocuspocus-rs = { version = "0.1.0", features = ["server"] }
+hocuspocus-rs = { version = "0.1.2", features = ["server"] }
 ```
 
 ### Feature Flags
 
 - **`server` (Recommended)**: Enables `axum` integration and provides built-in WebSocket handlers for synchronization.
 - **`sqlite`**: Enables `rusqlite` persistence layer to store document updates.
+
+## Performance Profile and Intended Use
+
+This crate is designed for high performance in low-concurrency environments.
+
+- It is single-threaded by design for document persistence, because SQLite is single-threaded in this architecture.
+- It is ideal for a handful of users collaborating across multiple devices (low concurrent load).
+- It is especially well-suited for embedding collaborative sync into applications.
+- It is currently used both as a standalone personal server deployment and embedded inside a Tauri desktop app.
+
+If you need to support many users concurrently, prefer the `hocuspocus-rs-ws` crate: https://github.com/albireo3754/hocuspocus-rs-ws
 
 ## Client Compatibility
 
