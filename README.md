@@ -11,6 +11,7 @@ This crate provides a thread-safe handler for Yjs documents that follows the Hoc
 - **Optional Persistence**: Built-in SQLite persistence with debounced saving (via `sqlite` feature).
 - **Awareness**: Forwarding of awareness/presence messages.
 - **Axum Integration**: Built-in WebSocket handlers for the Axum web framework (via `server` feature).
+- **Resilient**: Mutex poison-recovery and graceful error handling — malformed client messages are rejected without crashing the server.
 
 ## Installation
 
@@ -19,7 +20,7 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 # For most users, 'server' is required to get the built-in sync server logic.
-hocuspocus-rs = { version = "0.1.2", features = ["server"] }
+hocuspocus-rs = { version = "0.1.3", features = ["server"] }
 ```
 
 ### Feature Flags
@@ -40,7 +41,7 @@ If you need to support many users concurrently, prefer the `hocuspocus-rs-ws` cr
 
 ## Client Compatibility
 
-This server implementation is designed to connect with the **Hocuspocus JavaScript client**. 
+This server implementation is designed to connect with the **Hocuspocus JavaScript client** and **Dart/Flutter y-crdt clients**.
 
 In your frontend project, you can use the `@hocuspocus/provider` to connect:
 
