@@ -11,9 +11,9 @@
 //! Note: Awareness protocol (for cursors/presence) is handled by forwarding
 //! messages between clients without server-side state.
 
-use std::sync::Mutex as StdMutex;
 #[cfg(feature = "sqlite")]
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::broadcast;
 #[cfg(feature = "sqlite")]
 use tokio::sync::Mutex;
@@ -119,7 +119,10 @@ impl DocHandler {
     /// Generate the initial sync messages to send when a client connects
     /// Returns: [SyncStep1(server_state_vector)]
     pub fn generate_initial_sync(&self) -> Vec<Vec<u8>> {
-        let doc = self.doc.lock().unwrap();
+        let doc = self.doc.lock().unwrap_or_else(|e| {
+            tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
+            e.into_inner()
+        });
         let txn = doc.transact();
         let state_vector = txn.state_vector();
 
@@ -281,7 +284,13 @@ impl DocHandler {
                                         "Handling SyncStep1 (SV len: {})",
                                         client_sv.len()
                                     );
-                                    let doc = self.doc.lock().unwrap();
+                                    let doc = self.doc.lock().unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "Doc mutex was poisoned for '{}', recovering",
+                                            self.doc_name
+                                        );
+                                        e.into_inner()
+                                    });
                                     let txn = doc.transact();
 
                                     // Reply with SyncStep2 (updates client needs)
@@ -407,7 +416,10 @@ impl DocHandler {
         update_data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let update = Update::decode_v1(update_data)?;
-        let doc = self.doc.lock().unwrap();
+        let doc = self.doc.lock().unwrap_or_else(|e| {
+            tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
+            e.into_inner()
+        });
         let mut txn = doc.transact_mut();
         txn.apply_update(update);
         Ok(())
@@ -445,7 +457,13 @@ impl DocHandler {
 
                 // Encode the state before spawning since Doc isn't Send
                 let state = {
-                    let doc = self.doc.lock().unwrap();
+                    let doc = self.doc.lock().unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "Doc mutex was poisoned for '{}', recovering",
+                            self.doc_name
+                        );
+                        e.into_inner()
+                    });
                     let txn = doc.transact();
                     txn.encode_state_as_update_v1(&StateVector::default())
                 };
@@ -488,7 +506,10 @@ impl DocHandler {
         #[cfg(feature = "sqlite")]
         {
             let state = {
-                let doc = self.doc.lock().unwrap();
+                let doc = self.doc.lock().unwrap_or_else(|e| {
+                    tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
+                    e.into_inner()
+                });
                 let txn = doc.transact();
                 txn.encode_state_as_update_v1(&StateVector::default())
             };
@@ -514,10 +535,14 @@ impl DocHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::encoding::read::Read;
-    use yrs::updates::decoder::DecoderV1;
 
+    #[cfg(feature = "sqlite")]
+    use yrs::encoding::read::Read;
+    #[cfg(feature = "sqlite")]
+    use yrs::updates::decoder::DecoderV1;
+    #[cfg(feature = "sqlite")]
     use yrs::updates::encoder::{Encoder, EncoderV1};
+    #[cfg(feature = "sqlite")]
     use yrs::{GetString, Text, Transact};
 
     /// Creates an in-memory test database
@@ -526,6 +551,7 @@ mod tests {
         Database::init_in_memory().expect("Failed to create test database")
     }
 
+    #[cfg(feature = "sqlite")]
     fn encode_test_msg(doc_name: &str, msg_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut encoder = EncoderV1::new();
         encoder.write_string(doc_name);
@@ -535,6 +561,7 @@ mod tests {
         v
     }
 
+    #[cfg(feature = "sqlite")]
     fn encode_sync_step1(sv: &StateVector) -> Vec<u8> {
         let mut sv_encoder = EncoderV1::new();
         sv.encode(&mut sv_encoder);
@@ -546,6 +573,7 @@ mod tests {
         encoder.to_vec()
     }
 
+    #[cfg(feature = "sqlite")]
     fn encode_update(update: &[u8]) -> Vec<u8> {
         let mut encoder = EncoderV1::new();
         encoder.write_var(2u32); // Tag 2
@@ -749,12 +777,79 @@ mod tests {
     async fn test_doc_handler_no_sqlite() {
         let handler = DocHandler::new("test-room-no-db".to_string()).await;
         assert_eq!(handler.doc_name, "test-room-no-db");
-        
+
         // Basic sync generation should still work
         let messages = handler.generate_initial_sync();
         assert_eq!(messages.len(), 1);
-        
+
         let (_, name) = DocHandler::read_and_skip_doc_name(&messages[0]).unwrap();
         assert_eq!(name, "test-room-no-db");
+    }
+
+    // ---- Resilience tests: ensure no panics on malformed input ----
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_malformed_binary_message() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("test-room".to_string(), db).await;
+
+        // Pure garbage bytes should not panic
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
+        let responses = handler.handle_message(&garbage).await;
+        // Should gracefully return (possibly empty), not panic
+        let _ = responses;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_truncated_sync_message() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("test-room".to_string(), db).await;
+
+        // Valid doc name header + MSG_SYNC + truncated payload (incomplete SyncStep1)
+        let mut msg = Vec::new();
+        // VarString "test-room" = len 9 + bytes
+        msg.push(9);
+        msg.extend_from_slice(b"test-room");
+        msg.push(MSG_SYNC); // msg type
+        msg.push(0); // SyncStep1 tag
+        msg.push(99); // claims 99 bytes of SV data but provides none
+
+        let responses = handler.handle_message(&msg).await;
+        // Should return empty (decode failure logged), not panic
+        assert!(responses.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_invalid_update_data() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("test-room".to_string(), db).await;
+
+        // Valid envelope with Update tag (2) but invalid yrs data inside
+        let garbage_update = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let payload = encode_update(&garbage_update);
+        let msg = encode_test_msg("test-room", MSG_SYNC, &payload);
+
+        let responses = handler.handle_message(&msg).await;
+        // apply_update should return Err (logged), not panic
+        let _ = responses;
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_empty_content_after_doc_name() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("test-room".to_string(), db).await;
+
+        // Message with only doc name, no msg type or payload
+        let mut msg = Vec::new();
+        msg.push(9);
+        msg.extend_from_slice(b"test-room");
+        // Nothing after the doc name
+
+        let responses = handler.handle_message(&msg).await;
+        assert!(responses.is_empty());
     }
 }

@@ -38,3 +38,7 @@ sqlite = ["rusqlite"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "server"
+required-features = ["server", "sqlite"]

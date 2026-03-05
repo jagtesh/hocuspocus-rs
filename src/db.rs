@@ -47,7 +47,10 @@ impl Database {
         let name = name.to_string();
 
         task::spawn_blocking(move || {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock().unwrap_or_else(|e| {
+                tracing::warn!("DB mutex was poisoned, recovering");
+                e.into_inner()
+            });
             let mut stmt = conn.prepare("SELECT data FROM documents WHERE name = ?1")?;
             let mut rows = stmt.query(params![name])?;
 
@@ -66,7 +69,10 @@ impl Database {
         let name = name.to_string();
 
         task::spawn_blocking(move || {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock().unwrap_or_else(|e| {
+                tracing::warn!("DB mutex was poisoned, recovering");
+                e.into_inner()
+            });
             conn.execute(
                 "INSERT INTO documents (name, data) VALUES (?1, ?2)
                  ON CONFLICT(name) DO UPDATE SET data = ?2",

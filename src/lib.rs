@@ -3,13 +3,13 @@
 //! A Rust implementation of the Hocuspocus protocol (Yjs over WebSockets).
 //! Provides a handler for Yjs documents that follows the Hocuspocus V2 protocol structure.
 
-pub mod sync;
 #[cfg(feature = "sqlite")]
 pub mod db;
+pub mod sync;
 
-pub use sync::{DocHandler, MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC};
 #[cfg(feature = "sqlite")]
 pub use db::Database;
+pub use sync::{DocHandler, MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC};
 
 #[cfg(feature = "server")]
 use axum::{
@@ -187,6 +187,10 @@ pub async fn run_connection(
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         tracing::debug!("Client disconnected from room '{}'", room_name);
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!("WebSocket error in room '{}': {:?}", room_name, e);
                         return;
                     }
                     _ => {}
