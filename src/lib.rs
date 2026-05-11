@@ -9,7 +9,7 @@ pub mod sync;
 
 #[cfg(feature = "sqlite")]
 pub use db::Database;
-pub use sync::{DocHandler, MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC};
+pub use sync::{DocHandler, UpdateHook, MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC};
 
 #[cfg(feature = "server")]
 use axum::{
@@ -37,22 +37,35 @@ pub struct AppState {
     pub rooms: DashMap<String, Arc<DocHandler>>,
     #[cfg(feature = "sqlite")]
     pub db: Database,
+    update_hook: Option<UpdateHook>,
 }
 
 #[cfg(feature = "server")]
 impl AppState {
     #[cfg(feature = "sqlite")]
     pub fn new(db: Database) -> Self {
+        Self::new_with_update_hook(db, None)
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub fn new_with_update_hook(db: Database, update_hook: Option<UpdateHook>) -> Self {
         Self {
             rooms: DashMap::new(),
             db,
+            update_hook,
         }
     }
 
     #[cfg(not(feature = "sqlite"))]
     pub fn new() -> Self {
+        Self::new_with_update_hook(None)
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    pub fn new_with_update_hook(update_hook: Option<UpdateHook>) -> Self {
         Self {
             rooms: DashMap::new(),
+            update_hook,
         }
     }
 
@@ -65,16 +78,20 @@ impl AppState {
                 #[cfg(feature = "sqlite")]
                 {
                     let db = self.db.clone();
+                    let update_hook = self.update_hook.clone();
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(async { Arc::new(DocHandler::new(name, db).await) })
+                        tokio::runtime::Handle::current().block_on(async {
+                            Arc::new(DocHandler::new_with_update_hook(name, db, update_hook).await)
+                        })
                     })
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
+                    let update_hook = self.update_hook.clone();
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(async { Arc::new(DocHandler::new(name).await) })
+                        tokio::runtime::Handle::current().block_on(async {
+                            Arc::new(DocHandler::new_with_update_hook(name, update_hook).await)
+                        })
                     })
                 }
             })

@@ -13,7 +13,7 @@
 
 #[cfg(feature = "sqlite")]
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc as StdArc, Mutex as StdMutex};
 use tokio::sync::broadcast;
 #[cfg(feature = "sqlite")]
 use tokio::sync::Mutex;
@@ -23,7 +23,7 @@ use yrs::encoding::read::Read;
 use yrs::encoding::write::Write;
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
+use yrs::{Doc, ReadTxn, StateVector, Transact, TransactionMut, Update};
 
 #[cfg(feature = "sqlite")]
 use crate::db::Database;
@@ -39,6 +39,14 @@ pub const MSG_QUERY_AWARENESS: u8 = 3;
 #[cfg(feature = "sqlite")]
 const PERSIST_DEBOUNCE_MS: u64 = 500;
 
+/// A synchronous hook that can repair application-specific invariants after an
+/// incoming Yjs update has been applied.
+///
+/// The hook receives a mutable transaction and should return the number of
+/// repairs it made. Any non-zero return value is encoded as an update,
+/// broadcast to peers, and included in persistence.
+pub type UpdateHook = StdArc<dyn Fn(&mut TransactionMut) -> usize + Send + Sync>;
+
 /// A handler for a single Yjs document/room
 /// Manages the document state, persistence, and broadcasting
 ///
@@ -53,6 +61,8 @@ pub struct DocHandler {
     db: Database,
     /// Broadcast channel for sending updates to other clients
     pub broadcast_tx: broadcast::Sender<Vec<u8>>,
+    /// Optional application-level invariant repair hook.
+    update_hook: Option<UpdateHook>,
     /// Track when persistence was last requested for debouncing
     #[cfg(feature = "sqlite")]
     last_persist_request: Arc<Mutex<Option<Instant>>>,
@@ -69,6 +79,15 @@ unsafe impl Sync for DocHandler {}
 impl DocHandler {
     #[cfg(feature = "sqlite")]
     pub async fn new(doc_name: String, db: Database) -> Self {
+        Self::new_with_update_hook(doc_name, db, None).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub async fn new_with_update_hook(
+        doc_name: String,
+        db: Database,
+        update_hook: Option<UpdateHook>,
+    ) -> Self {
         let doc = Doc::new();
         let (broadcast_tx, _) = broadcast::channel(256);
 
@@ -99,6 +118,7 @@ impl DocHandler {
             doc: StdMutex::new(doc),
             db,
             broadcast_tx,
+            update_hook,
             last_persist_request: Arc::new(Mutex::new(None)),
             persist_pending: Arc::new(Mutex::new(false)),
         }
@@ -106,6 +126,11 @@ impl DocHandler {
 
     #[cfg(not(feature = "sqlite"))]
     pub async fn new(doc_name: String) -> Self {
+        Self::new_with_update_hook(doc_name, None).await
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    pub async fn new_with_update_hook(doc_name: String, update_hook: Option<UpdateHook>) -> Self {
         let doc = Doc::new();
         let (broadcast_tx, _) = broadcast::channel(256);
 
@@ -113,6 +138,7 @@ impl DocHandler {
             doc_name,
             doc: StdMutex::new(doc),
             broadcast_tx,
+            update_hook,
         }
     }
 
@@ -362,6 +388,11 @@ impl DocHandler {
                                     update_data
                                 );
                             } else {
+                                if let Some(repair_update) = self.run_update_hook() {
+                                    let msg = self.encode_sync_update(&repair_update);
+                                    responses.push(msg.clone());
+                                    let _ = self.broadcast_tx.send(msg);
+                                }
                                 tracing::debug!("Applied SyncStep2 update for '{}'", self.doc_name);
                                 self.request_persist().await;
                             }
@@ -393,6 +424,12 @@ impl DocHandler {
                                     self.encode_hocuspocus_message(MSG_SYNC, &encoder.to_vec());
                                 let _ = self.broadcast_tx.send(msg);
 
+                                if let Some(repair_update) = self.run_update_hook() {
+                                    let msg = self.encode_sync_update(&repair_update);
+                                    responses.push(msg.clone());
+                                    let _ = self.broadcast_tx.send(msg);
+                                }
+
                                 self.request_persist().await;
                             }
                         }
@@ -408,6 +445,48 @@ impl DocHandler {
                 }
             }
         }
+    }
+
+    fn encode_sync_update(&self, update_data: &[u8]) -> Vec<u8> {
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(2u32);
+        encoder.write_buf(update_data);
+        self.encode_hocuspocus_message(MSG_SYNC, &encoder.to_vec())
+    }
+
+    fn run_update_hook(&self) -> Option<Vec<u8>> {
+        let hook = self.update_hook.as_ref()?;
+        let doc = self.doc.lock().unwrap_or_else(|e| {
+            tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
+            e.into_inner()
+        });
+
+        let before_repair = {
+            let txn = doc.transact();
+            txn.state_vector()
+        };
+
+        let repaired = {
+            let mut txn = doc.transact_mut();
+            hook(&mut txn)
+        };
+
+        if repaired == 0 {
+            return None;
+        }
+
+        let repair_update = {
+            let txn = doc.transact();
+            txn.encode_state_as_update_v1(&before_repair)
+        };
+
+        tracing::debug!(
+            "Repair hook made {} change(s) for '{}'",
+            repaired,
+            self.doc_name
+        );
+
+        Some(repair_update)
     }
 
     /// Apply a Yjs update to the document
@@ -543,7 +622,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     use yrs::updates::encoder::{Encoder, EncoderV1};
     #[cfg(feature = "sqlite")]
-    use yrs::{GetString, Text, Transact};
+    use yrs::{GetString, Text, Transact, WriteTxn};
 
     /// Creates an in-memory test database
     #[cfg(feature = "sqlite")]
@@ -579,6 +658,38 @@ mod tests {
         encoder.write_var(2u32); // Tag 2
         encoder.write_buf(update);
         encoder.to_vec()
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn extract_sync_update(message: &[u8]) -> Vec<u8> {
+        let (rest, _name) = DocHandler::read_and_skip_doc_name(message).unwrap();
+        let mut decoder = DecoderV1::from(rest);
+        let msg_type: u32 = decoder.read_var().unwrap();
+        assert_eq!(msg_type as u8, MSG_SYNC);
+        let tag: u32 = decoder.read_var().unwrap();
+        assert_eq!(tag, 2);
+        decoder.read_buf().unwrap().to_vec()
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn repair_text(handler: &DocHandler) -> String {
+        let doc = handler.doc.lock().unwrap();
+        let txn = doc.transact();
+        let text = txn.get_text("repair").unwrap();
+        text.get_string(&txn)
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn single_repair_hook() -> UpdateHook {
+        std::sync::Arc::new(|txn| {
+            let text = txn.get_or_insert_text("repair");
+            if text.get_string(txn).is_empty() {
+                text.push(txn, "fixed");
+                1
+            } else {
+                0
+            }
+        })
     }
 
     #[tokio::test]
@@ -698,6 +809,87 @@ mod tests {
         let saved = db.get_doc("test-room").await.unwrap();
         assert!(saved.is_some());
         assert!(!saved.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_update_hook_returns_repair_update_to_sender() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new_with_update_hook(
+            "test-room".to_string(),
+            db,
+            Some(single_repair_hook()),
+        )
+        .await;
+
+        let client_doc = Doc::new();
+        let update = {
+            let text = client_doc.get_or_insert_text("content");
+            let mut txn = client_doc.transact_mut();
+            text.push(&mut txn, "client data");
+            txn.encode_update_v1()
+        };
+
+        let payload = encode_update(&update);
+        let msg = encode_test_msg("test-room", MSG_SYNC, &payload);
+        let responses = handler.handle_message(&msg).await;
+
+        assert_eq!(responses.len(), 1);
+        let repair_update = extract_sync_update(&responses[0]);
+        let receiver_doc = Doc::new();
+        {
+            let mut txn = receiver_doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&repair_update).unwrap());
+        }
+        let repair = receiver_doc.get_or_insert_text("repair");
+        assert_eq!(repair.get_string(&receiver_doc.transact()), "fixed");
+        assert_eq!(repair_text(&handler), "fixed");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_update_hook_repair_is_broadcast_and_persisted() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new_with_update_hook(
+            "hook-room".to_string(),
+            db.clone(),
+            Some(single_repair_hook()),
+        )
+        .await;
+        let mut rx = handler.subscribe();
+
+        let client_doc = Doc::new();
+        let update = {
+            let text = client_doc.get_or_insert_text("content");
+            let mut txn = client_doc.transact_mut();
+            text.push(&mut txn, "client data");
+            txn.encode_update_v1()
+        };
+
+        let payload = encode_update(&update);
+        let msg = encode_test_msg("hook-room", MSG_SYNC, &payload);
+        handler.handle_message(&msg).await;
+
+        let original = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let repair = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            DocHandler::read_and_skip_doc_name(&original).unwrap().1,
+            "hook-room"
+        );
+        assert_eq!(
+            DocHandler::read_and_skip_doc_name(&repair).unwrap().1,
+            "hook-room"
+        );
+
+        handler.force_persist().await;
+        let reloaded = DocHandler::new("hook-room".to_string(), db).await;
+        assert_eq!(repair_text(&reloaded), "fixed");
     }
 
     #[tokio::test]

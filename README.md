@@ -20,7 +20,7 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 # For most users, 'server' is required to get the built-in sync server logic.
-hocuspocus-rs = { version = "0.1.3", features = ["server"] }
+hocuspocus-rs = { version = "0.1.4", features = ["server"] }
 ```
 
 ### Feature Flags
