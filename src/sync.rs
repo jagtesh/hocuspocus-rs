@@ -34,6 +34,7 @@ pub const MSG_SYNC: u8 = 0;
 pub const MSG_AWARENESS: u8 = 1;
 pub const MSG_AUTH: u8 = 2; // Hocuspocus-specific
 pub const MSG_QUERY_AWARENESS: u8 = 3;
+pub const MSG_SYNC_STATUS: u8 = 8;
 
 /// Debounce interval for persistence (milliseconds)
 #[cfg(feature = "sqlite")]
@@ -378,6 +379,7 @@ impl DocHandler {
                             );
                             if update_data.is_empty() {
                                 tracing::debug!("Received empty SyncStep2 update, ignoring");
+                                responses.push(self.encode_sync_status(true));
                                 continue;
                             }
 
@@ -394,6 +396,7 @@ impl DocHandler {
                                     let _ = self.broadcast_tx.send(msg);
                                 }
                                 tracing::debug!("Applied SyncStep2 update for '{}'", self.doc_name);
+                                responses.push(self.encode_sync_status(true));
                                 self.request_persist().await;
                             }
                         }
@@ -430,6 +433,7 @@ impl DocHandler {
                                     let _ = self.broadcast_tx.send(msg);
                                 }
 
+                                responses.push(self.encode_sync_status(true));
                                 self.request_persist().await;
                             }
                         }
@@ -452,6 +456,12 @@ impl DocHandler {
         encoder.write_var(2u32);
         encoder.write_buf(update_data);
         self.encode_hocuspocus_message(MSG_SYNC, &encoder.to_vec())
+    }
+
+    fn encode_sync_status(&self, applied: bool) -> Vec<u8> {
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(if applied { 1u32 } else { 0u32 });
+        self.encode_hocuspocus_message(MSG_SYNC_STATUS, &encoder.to_vec())
     }
 
     fn run_update_hook(&self) -> Option<Vec<u8>> {
@@ -661,6 +671,14 @@ mod tests {
     }
 
     #[cfg(feature = "sqlite")]
+    fn encode_sync_step2(update: &[u8]) -> Vec<u8> {
+        let mut encoder = EncoderV1::new();
+        encoder.write_var(1u32); // Tag 1
+        encoder.write_buf(update);
+        encoder.to_vec()
+    }
+
+    #[cfg(feature = "sqlite")]
     fn extract_sync_update(message: &[u8]) -> Vec<u8> {
         let (rest, _name) = DocHandler::read_and_skip_doc_name(message).unwrap();
         let mut decoder = DecoderV1::from(rest);
@@ -669,6 +687,15 @@ mod tests {
         let tag: u32 = decoder.read_var().unwrap();
         assert_eq!(tag, 2);
         decoder.read_buf().unwrap().to_vec()
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn is_applied_sync_status(message: &[u8]) -> bool {
+        let (rest, _name) = DocHandler::read_and_skip_doc_name(message).unwrap();
+        let mut decoder = DecoderV1::from(rest);
+        let msg_type: u32 = decoder.read_var().unwrap();
+        let applied: u32 = decoder.read_var().unwrap();
+        msg_type as u8 == MSG_SYNC_STATUS && applied == 1
     }
 
     #[cfg(feature = "sqlite")]
@@ -769,7 +796,13 @@ mod tests {
         let payload = encode_update(&update);
         let msg = encode_test_msg("test-room", MSG_SYNC, &payload);
 
-        let _responses = handler.handle_message(&msg).await;
+        let responses = handler.handle_message(&msg).await;
+        assert!(
+            responses
+                .iter()
+                .any(|response| is_applied_sync_status(response)),
+            "server must acknowledge applied updates so clients clear unsynced state"
+        );
 
         // Should have broadcast the update
         let broadcast = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
@@ -813,6 +846,20 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "sqlite")]
+    async fn test_empty_sync_step2_acknowledges_initial_handshake() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("test-room".to_string(), db).await;
+
+        let payload = encode_sync_step2(&[]);
+        let msg = encode_test_msg("test-room", MSG_SYNC, &payload);
+        let responses = handler.handle_message(&msg).await;
+
+        assert_eq!(responses.len(), 1);
+        assert!(is_applied_sync_status(&responses[0]));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn test_update_hook_returns_repair_update_to_sender() {
         let db = create_test_db().await;
         let handler = DocHandler::new_with_update_hook(
@@ -834,8 +881,18 @@ mod tests {
         let msg = encode_test_msg("test-room", MSG_SYNC, &payload);
         let responses = handler.handle_message(&msg).await;
 
-        assert_eq!(responses.len(), 1);
-        let repair_update = extract_sync_update(&responses[0]);
+        assert_eq!(responses.len(), 2);
+        assert!(
+            responses
+                .iter()
+                .any(|response| is_applied_sync_status(response)),
+            "sender should receive a syncStatus ack after the update is applied"
+        );
+        let repair_response = responses
+            .iter()
+            .find(|response| !is_applied_sync_status(response))
+            .unwrap();
+        let repair_update = extract_sync_update(repair_response);
         let receiver_doc = Doc::new();
         {
             let mut txn = receiver_doc.transact_mut();
