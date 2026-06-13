@@ -56,7 +56,7 @@ pub type UpdateHook = StdArc<dyn Fn(&mut TransactionMut) -> usize + Send + Sync>
 pub struct DocHandler {
     pub doc_name: String,
     /// Thread-safe document access using std Mutex (Doc ops are sync & fast)
-    doc: StdMutex<Doc>,
+    doc: StdArc<StdMutex<Doc>>,
     /// Database for persistence
     #[cfg(feature = "sqlite")]
     db: Database,
@@ -116,7 +116,7 @@ impl DocHandler {
 
         Self {
             doc_name,
-            doc: StdMutex::new(doc),
+            doc: StdArc::new(StdMutex::new(doc)),
             db,
             broadcast_tx,
             update_hook,
@@ -137,7 +137,7 @@ impl DocHandler {
 
         Self {
             doc_name,
-            doc: StdMutex::new(doc),
+            doc: StdArc::new(StdMutex::new(doc)),
             broadcast_tx,
             update_hook,
         }
@@ -323,6 +323,12 @@ impl DocHandler {
                                     // Reply with SyncStep2 (updates client needs)
                                     // [Tag 1] [Len] [Bytes]
                                     let update = txn.encode_state_as_update_v1(&client_sv);
+                                    tracing::debug!(
+                                        doc = %self.doc_name,
+                                        update_bytes = update.len(),
+                                        client_state_vector_len = client_sv.len(),
+                                        "encoded SyncStep2 response"
+                                    );
                                     let mut encoder = EncoderV1::new();
                                     encoder.write_var(1u32);
                                     encoder.write_buf(&update);
@@ -374,8 +380,9 @@ impl DocHandler {
                     match decoder.read_buf() {
                         Ok(update_data) => {
                             tracing::debug!(
-                                "Handling SyncStep2 (payload len: {})",
-                                update_data.len()
+                                doc = %self.doc_name,
+                                update_bytes = update_data.len(),
+                                "handling SyncStep2 update"
                             );
                             if update_data.is_empty() {
                                 tracing::debug!("Received empty SyncStep2 update, ignoring");
@@ -410,6 +417,11 @@ impl DocHandler {
                     // Update: [Tag 2] [Len] [Bytes]
                     match decoder.read_buf() {
                         Ok(update_data) => {
+                            tracing::debug!(
+                                doc = %self.doc_name,
+                                update_bytes = update_data.len(),
+                                "handling incremental update"
+                            );
                             if let Err(e) = self.apply_update(update_data) {
                                 tracing::error!("Failed to apply incremental update: {:?}", e);
                             } else {
@@ -466,6 +478,7 @@ impl DocHandler {
 
     fn run_update_hook(&self) -> Option<Vec<u8>> {
         let hook = self.update_hook.as_ref()?;
+        let started = std::time::Instant::now();
         let doc = self.doc.lock().unwrap_or_else(|e| {
             tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
             e.into_inner()
@@ -482,6 +495,11 @@ impl DocHandler {
         };
 
         if repaired == 0 {
+            tracing::debug!(
+                doc = %self.doc_name,
+                elapsed_ms = started.elapsed().as_millis(),
+                "update hook checked"
+            );
             return None;
         }
 
@@ -490,10 +508,12 @@ impl DocHandler {
             txn.encode_state_as_update_v1(&before_repair)
         };
 
-        tracing::debug!(
-            "Repair hook made {} change(s) for '{}'",
+        tracing::info!(
+            doc = %self.doc_name,
             repaired,
-            self.doc_name
+            repair_update_bytes = repair_update.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "update hook repaired document"
         );
 
         Some(repair_update)
@@ -541,49 +561,68 @@ impl DocHandler {
                 // Clone what we need for the spawned task
                 let doc_name = self.doc_name.clone();
                 let db = self.db.clone();
+                let doc = self.doc.clone();
                 let last_persist_request = self.last_persist_request.clone();
                 let persist_pending = self.persist_pending.clone();
 
-                // Encode the state before spawning since Doc isn't Send
-                let state = {
-                    let doc = self.doc.lock().unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "Doc mutex was poisoned for '{}', recovering",
-                            self.doc_name
-                        );
-                        e.into_inner()
-                    });
-                    let txn = doc.transact();
-                    txn.encode_state_as_update_v1(&StateVector::default())
-                };
-
                 tokio::spawn(async move {
-                    // Wait for debounce interval
-                    tokio::time::sleep(Duration::from_millis(PERSIST_DEBOUNCE_MS)).await;
+                    let debounce = Duration::from_millis(PERSIST_DEBOUNCE_MS);
 
-                    // Check if there were more updates during the wait
-                    let should_persist = {
-                        let last_request = last_persist_request.lock().await;
-                        if let Some(last) = *last_request {
-                            last.elapsed() >= Duration::from_millis(PERSIST_DEBOUNCE_MS - 50)
-                        } else {
-                            true
-                        }
-                    };
+                    loop {
+                        let persisted_request = loop {
+                            let sleep_for = {
+                                let last_request = last_persist_request.lock().await;
+                                match *last_request {
+                                    Some(last) => {
+                                        let elapsed = last.elapsed();
+                                        if elapsed >= debounce {
+                                            break last;
+                                        }
+                                        debounce - elapsed
+                                    }
+                                    None => debounce,
+                                }
+                            };
+                            tokio::time::sleep(sleep_for).await;
+                        };
 
-                    if should_persist {
-                        // Save to database
+                        let state = {
+                            let doc = doc.lock().unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "Doc mutex was poisoned for '{}', recovering",
+                                    doc_name
+                                );
+                                e.into_inner()
+                            });
+                            let txn = doc.transact();
+                            txn.encode_state_as_update_v1(&StateVector::default())
+                        };
+
                         if let Err(e) = db.save_doc(&doc_name, state).await {
                             tracing::error!("Failed to persist document '{}': {:?}", doc_name, e);
                         } else {
                             tracing::debug!("Persisted document '{}'", doc_name);
                         }
-                    }
 
-                    // Clear pending flag
-                    {
+                        {
+                            let mut pending = persist_pending.lock().await;
+                            *pending = false;
+                        }
+
+                        let latest_request = {
+                            let last_request = last_persist_request.lock().await;
+                            *last_request
+                        };
+
+                        if latest_request == Some(persisted_request) {
+                            break;
+                        }
+
                         let mut pending = persist_pending.lock().await;
-                        *pending = false;
+                        if *pending {
+                            break;
+                        }
+                        *pending = true;
                     }
                 });
             }
@@ -842,6 +881,41 @@ mod tests {
         let saved = db.get_doc("test-room").await.unwrap();
         assert!(saved.is_some());
         assert!(!saved.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_debounced_persistence_saves_latest_live_state() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("debounce-room".to_string(), db.clone()).await;
+        let client_doc = Doc::new();
+        let text = client_doc.get_or_insert_text("test");
+
+        let first_update = {
+            let mut txn = client_doc.transact_mut();
+            text.push(&mut txn, "first");
+            txn.encode_update_v1()
+        };
+        let first_msg = encode_test_msg("debounce-room", MSG_SYNC, &encode_update(&first_update));
+        handler.handle_message(&first_msg).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let second_update = {
+            let mut txn = client_doc.transact_mut();
+            text.push(&mut txn, "second");
+            txn.encode_update_v1()
+        };
+        let second_msg = encode_test_msg("debounce-room", MSG_SYNC, &encode_update(&second_update));
+        handler.handle_message(&second_msg).await;
+
+        tokio::time::sleep(Duration::from_millis(PERSIST_DEBOUNCE_MS * 2 + 250)).await;
+
+        let reloaded = DocHandler::new("debounce-room".to_string(), db).await;
+        let doc = reloaded.doc.lock().unwrap();
+        let text = doc.get_or_insert_text("test");
+        let txn = doc.transact();
+        assert_eq!(text.get_string(&txn), "firstsecond");
     }
 
     #[tokio::test]
