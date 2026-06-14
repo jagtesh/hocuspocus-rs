@@ -14,10 +14,7 @@
 #[cfg(feature = "sqlite")]
 use std::sync::Arc;
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
-use tokio::sync::broadcast;
-#[cfg(feature = "sqlite")]
-use tokio::sync::Mutex;
-#[cfg(feature = "sqlite")]
+use tokio::sync::{broadcast, Mutex as TokioMutex};
 use tokio::time::{Duration, Instant};
 use yrs::encoding::read::Read;
 use yrs::encoding::write::Write;
@@ -40,6 +37,9 @@ pub const MSG_SYNC_STATUS: u8 = 8;
 #[cfg(feature = "sqlite")]
 const PERSIST_DEBOUNCE_MS: u64 = 500;
 
+/// Debounce interval for application repair hooks (milliseconds)
+const UPDATE_HOOK_DEBOUNCE_MS: u64 = 250;
+
 /// A synchronous hook that can repair application-specific invariants after an
 /// incoming Yjs update has been applied.
 ///
@@ -47,6 +47,13 @@ const PERSIST_DEBOUNCE_MS: u64 = 500;
 /// repairs it made. Any non-zero return value is encoded as an update,
 /// broadcast to peers, and included in persistence.
 pub type UpdateHook = StdArc<dyn Fn(&mut TransactionMut) -> usize + Send + Sync>;
+
+#[derive(Default)]
+struct UpdateHookSchedulerState {
+    running: bool,
+    dirty: bool,
+    coalesced_updates: u64,
+}
 
 /// A handler for a single Yjs document/room
 /// Manages the document state, persistence, and broadcasting
@@ -64,12 +71,14 @@ pub struct DocHandler {
     pub broadcast_tx: broadcast::Sender<Vec<u8>>,
     /// Optional application-level invariant repair hook.
     update_hook: Option<UpdateHook>,
+    /// Coalesces repair hook work so incremental content updates stay cheap.
+    update_hook_scheduler: StdArc<TokioMutex<UpdateHookSchedulerState>>,
     /// Track when persistence was last requested for debouncing
     #[cfg(feature = "sqlite")]
-    last_persist_request: Arc<Mutex<Option<Instant>>>,
+    last_persist_request: Arc<TokioMutex<Option<Instant>>>,
     /// Flag to indicate persistence is pending
     #[cfg(feature = "sqlite")]
-    persist_pending: Arc<Mutex<bool>>,
+    persist_pending: Arc<TokioMutex<bool>>,
 }
 
 // Explicitly mark DocHandler as Send + Sync since we use std::sync::Mutex
@@ -120,8 +129,11 @@ impl DocHandler {
             db,
             broadcast_tx,
             update_hook,
-            last_persist_request: Arc::new(Mutex::new(None)),
-            persist_pending: Arc::new(Mutex::new(false)),
+            update_hook_scheduler: StdArc::new(
+                TokioMutex::new(UpdateHookSchedulerState::default()),
+            ),
+            last_persist_request: Arc::new(TokioMutex::new(None)),
+            persist_pending: Arc::new(TokioMutex::new(false)),
         }
     }
 
@@ -140,6 +152,9 @@ impl DocHandler {
             doc: StdArc::new(StdMutex::new(doc)),
             broadcast_tx,
             update_hook,
+            update_hook_scheduler: StdArc::new(
+                TokioMutex::new(UpdateHookSchedulerState::default()),
+            ),
         }
     }
 
@@ -397,12 +412,13 @@ impl DocHandler {
                                     update_data
                                 );
                             } else {
-                                if let Some(repair_update) = self.run_update_hook() {
-                                    let msg = self.encode_sync_update(&repair_update);
-                                    responses.push(msg.clone());
-                                    let _ = self.broadcast_tx.send(msg);
-                                }
-                                tracing::debug!("Applied SyncStep2 update for '{}'", self.doc_name);
+                                tracing::debug!(
+                                    doc = %self.doc_name,
+                                    update_bytes = update_data.len(),
+                                    "applied SyncStep2 update"
+                                );
+                                self.broadcast_sync_update(update_data);
+                                self.schedule_update_hook().await;
                                 responses.push(self.encode_sync_status(true));
                                 self.request_persist().await;
                             }
@@ -426,25 +442,13 @@ impl DocHandler {
                                 tracing::error!("Failed to apply incremental update: {:?}", e);
                             } else {
                                 tracing::debug!(
-                                    "Applied incremental update for '{}'",
-                                    self.doc_name
+                                    doc = %self.doc_name,
+                                    update_bytes = update_data.len(),
+                                    "applied incremental update"
                                 );
 
-                                // Broadcast to other clients - MUST include Hocuspocus prefix
-                                // Broadcast format: [Tag 2] [Len] [Bytes]
-                                let mut encoder = EncoderV1::new();
-                                encoder.write_var(2u32);
-                                encoder.write_buf(update_data);
-                                let msg =
-                                    self.encode_hocuspocus_message(MSG_SYNC, &encoder.to_vec());
-                                let _ = self.broadcast_tx.send(msg);
-
-                                if let Some(repair_update) = self.run_update_hook() {
-                                    let msg = self.encode_sync_update(&repair_update);
-                                    responses.push(msg.clone());
-                                    let _ = self.broadcast_tx.send(msg);
-                                }
-
+                                self.broadcast_sync_update(update_data);
+                                self.schedule_update_hook().await;
                                 responses.push(self.encode_sync_status(true));
                                 self.request_persist().await;
                             }
@@ -476,11 +480,32 @@ impl DocHandler {
         self.encode_hocuspocus_message(MSG_SYNC_STATUS, &encoder.to_vec())
     }
 
-    fn run_update_hook(&self) -> Option<Vec<u8>> {
-        let hook = self.update_hook.as_ref()?;
+    fn broadcast_sync_update(&self, update_data: &[u8]) {
+        let msg = self.encode_sync_update(update_data);
+        match self.broadcast_tx.send(msg) {
+            Ok(receiver_count) => tracing::trace!(
+                doc = %self.doc_name,
+                update_bytes = update_data.len(),
+                receiver_count,
+                "broadcast sync update"
+            ),
+            Err(e) => tracing::trace!(
+                doc = %self.doc_name,
+                update_bytes = update_data.len(),
+                error = ?e,
+                "sync update broadcast had no receivers"
+            ),
+        }
+    }
+
+    fn run_update_hook_for(
+        doc_name: &str,
+        doc: &StdArc<StdMutex<Doc>>,
+        hook: &UpdateHook,
+    ) -> Option<Vec<u8>> {
         let started = std::time::Instant::now();
-        let doc = self.doc.lock().unwrap_or_else(|e| {
-            tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
+        let doc = doc.lock().unwrap_or_else(|e| {
+            tracing::warn!("Doc mutex was poisoned for '{}', recovering", doc_name);
             e.into_inner()
         });
 
@@ -496,7 +521,7 @@ impl DocHandler {
 
         if repaired == 0 {
             tracing::debug!(
-                doc = %self.doc_name,
+                doc = %doc_name,
                 elapsed_ms = started.elapsed().as_millis(),
                 "update hook checked"
             );
@@ -509,7 +534,7 @@ impl DocHandler {
         };
 
         tracing::info!(
-            doc = %self.doc_name,
+            doc = %doc_name,
             repaired,
             repair_update_bytes = repair_update.len(),
             elapsed_ms = started.elapsed().as_millis(),
@@ -519,11 +544,130 @@ impl DocHandler {
         Some(repair_update)
     }
 
+    async fn schedule_update_hook(&self) {
+        let Some(hook) = self.update_hook.clone() else {
+            return;
+        };
+
+        let mut scheduler = self.update_hook_scheduler.lock().await;
+        scheduler.dirty = true;
+
+        if scheduler.running {
+            scheduler.coalesced_updates += 1;
+            tracing::trace!(
+                doc = %self.doc_name,
+                coalesced_updates = scheduler.coalesced_updates,
+                "coalesced update hook request"
+            );
+            return;
+        }
+
+        scheduler.running = true;
+        let doc_name = self.doc_name.clone();
+        let doc = self.doc.clone();
+        let broadcast_tx = self.broadcast_tx.clone();
+        let scheduler_state = self.update_hook_scheduler.clone();
+        #[cfg(feature = "sqlite")]
+        let db = self.db.clone();
+        #[cfg(feature = "sqlite")]
+        let last_persist_request = self.last_persist_request.clone();
+        #[cfg(feature = "sqlite")]
+        let persist_pending = self.persist_pending.clone();
+
+        tracing::debug!(
+            doc = %doc_name,
+            debounce_ms = UPDATE_HOOK_DEBOUNCE_MS,
+            "scheduled update hook"
+        );
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(UPDATE_HOOK_DEBOUNCE_MS)).await;
+
+                let coalesced_updates = {
+                    let mut scheduler = scheduler_state.lock().await;
+                    scheduler.dirty = false;
+                    let coalesced = scheduler.coalesced_updates;
+                    scheduler.coalesced_updates = 0;
+                    coalesced
+                };
+
+                tracing::debug!(
+                    doc = %doc_name,
+                    coalesced_updates,
+                    "running update hook"
+                );
+
+                let repair_update = Self::run_update_hook_for(&doc_name, &doc, &hook);
+
+                if let Some(repair_update) = repair_update {
+                    let msg = Self::encode_hocuspocus_sync_update(&doc_name, &repair_update);
+                    match broadcast_tx.send(msg) {
+                        Ok(receiver_count) => tracing::debug!(
+                            doc = %doc_name,
+                            repair_update_bytes = repair_update.len(),
+                            receiver_count,
+                            "broadcast repair update"
+                        ),
+                        Err(e) => tracing::debug!(
+                            doc = %doc_name,
+                            repair_update_bytes = repair_update.len(),
+                            error = ?e,
+                            "repair update broadcast had no receivers"
+                        ),
+                    }
+
+                    #[cfg(feature = "sqlite")]
+                    {
+                        Self::request_persist_for(
+                            doc_name.clone(),
+                            db.clone(),
+                            doc.clone(),
+                            last_persist_request.clone(),
+                            persist_pending.clone(),
+                        )
+                        .await;
+                    }
+                }
+
+                let should_continue = {
+                    let mut scheduler = scheduler_state.lock().await;
+                    if scheduler.dirty {
+                        true
+                    } else {
+                        scheduler.running = false;
+                        false
+                    }
+                };
+
+                if !should_continue {
+                    tracing::debug!(doc = %doc_name, "update hook idle");
+                    break;
+                }
+            }
+        });
+    }
+
+    fn encode_hocuspocus_sync_update(doc_name: &str, update_data: &[u8]) -> Vec<u8> {
+        let mut update_encoder = EncoderV1::new();
+        update_encoder.write_var(2u32);
+        update_encoder.write_buf(update_data);
+
+        let mut envelope = EncoderV1::new();
+        envelope.write_string(doc_name);
+        envelope.write_var(MSG_SYNC as u32);
+
+        let mut encoded = envelope.to_vec();
+        encoded.extend_from_slice(&update_encoder.to_vec());
+        encoded
+    }
+
     /// Apply a Yjs update to the document
     pub fn apply_update(
         &self,
         update_data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let started = Instant::now();
         let update = Update::decode_v1(update_data)?;
         let doc = self.doc.lock().unwrap_or_else(|e| {
             tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
@@ -531,6 +675,12 @@ impl DocHandler {
         });
         let mut txn = doc.transact_mut();
         txn.apply_update(update);
+        tracing::debug!(
+            doc = %self.doc_name,
+            update_bytes = update_data.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "applied yrs update"
+        );
         Ok(())
     }
 
@@ -538,94 +688,102 @@ impl DocHandler {
     pub async fn request_persist(&self) {
         #[cfg(feature = "sqlite")]
         {
-            let now = Instant::now();
+            Self::request_persist_for(
+                self.doc_name.clone(),
+                self.db.clone(),
+                self.doc.clone(),
+                self.last_persist_request.clone(),
+                self.persist_pending.clone(),
+            )
+            .await;
+        }
+    }
 
+    #[cfg(feature = "sqlite")]
+    async fn request_persist_for(
+        doc_name: String,
+        db: Database,
+        doc: StdArc<StdMutex<Doc>>,
+        last_persist_request: Arc<TokioMutex<Option<Instant>>>,
+        persist_pending: Arc<TokioMutex<bool>>,
+    ) {
+        let now = Instant::now();
+
+        {
+            let mut last_request = last_persist_request.lock().await;
+            *last_request = Some(now);
+        }
+
+        // Check if persistence is already pending
+        let already_pending = {
+            let pending = persist_pending.lock().await;
+            *pending
+        };
+
+        if !already_pending {
+            // Mark as pending
             {
-                let mut last_request = self.last_persist_request.lock().await;
-                *last_request = Some(now);
+                let mut pending = persist_pending.lock().await;
+                *pending = true;
             }
 
-            // Check if persistence is already pending
-            let already_pending = {
-                let pending = self.persist_pending.lock().await;
-                *pending
-            };
+            tokio::spawn(async move {
+                let debounce = Duration::from_millis(PERSIST_DEBOUNCE_MS);
 
-            if !already_pending {
-                // Mark as pending
-                {
-                    let mut pending = self.persist_pending.lock().await;
+                loop {
+                    let persisted_request = loop {
+                        let sleep_for = {
+                            let last_request = last_persist_request.lock().await;
+                            match *last_request {
+                                Some(last) => {
+                                    let elapsed = last.elapsed();
+                                    if elapsed >= debounce {
+                                        break last;
+                                    }
+                                    debounce - elapsed
+                                }
+                                None => debounce,
+                            }
+                        };
+                        tokio::time::sleep(sleep_for).await;
+                    };
+
+                    let state = {
+                        let doc = doc.lock().unwrap_or_else(|e| {
+                            tracing::warn!("Doc mutex was poisoned for '{}', recovering", doc_name);
+                            e.into_inner()
+                        });
+                        let txn = doc.transact();
+                        txn.encode_state_as_update_v1(&StateVector::default())
+                    };
+
+                    if let Err(e) = db.save_doc(&doc_name, state).await {
+                        tracing::error!("Failed to persist document '{}': {:?}", doc_name, e);
+                    } else {
+                        tracing::debug!("Persisted document '{}'", doc_name);
+                    }
+
+                    {
+                        let mut pending = persist_pending.lock().await;
+                        *pending = false;
+                    }
+
+                    let latest_request = {
+                        let last_request = last_persist_request.lock().await;
+                        *last_request
+                    };
+
+                    if latest_request == Some(persisted_request) {
+                        break;
+                    }
+
+                    let mut pending = persist_pending.lock().await;
+                    if *pending {
+                        break;
+                    }
                     *pending = true;
                 }
-
-                // Clone what we need for the spawned task
-                let doc_name = self.doc_name.clone();
-                let db = self.db.clone();
-                let doc = self.doc.clone();
-                let last_persist_request = self.last_persist_request.clone();
-                let persist_pending = self.persist_pending.clone();
-
-                tokio::spawn(async move {
-                    let debounce = Duration::from_millis(PERSIST_DEBOUNCE_MS);
-
-                    loop {
-                        let persisted_request = loop {
-                            let sleep_for = {
-                                let last_request = last_persist_request.lock().await;
-                                match *last_request {
-                                    Some(last) => {
-                                        let elapsed = last.elapsed();
-                                        if elapsed >= debounce {
-                                            break last;
-                                        }
-                                        debounce - elapsed
-                                    }
-                                    None => debounce,
-                                }
-                            };
-                            tokio::time::sleep(sleep_for).await;
-                        };
-
-                        let state = {
-                            let doc = doc.lock().unwrap_or_else(|e| {
-                                tracing::warn!(
-                                    "Doc mutex was poisoned for '{}', recovering",
-                                    doc_name
-                                );
-                                e.into_inner()
-                            });
-                            let txn = doc.transact();
-                            txn.encode_state_as_update_v1(&StateVector::default())
-                        };
-
-                        if let Err(e) = db.save_doc(&doc_name, state).await {
-                            tracing::error!("Failed to persist document '{}': {:?}", doc_name, e);
-                        } else {
-                            tracing::debug!("Persisted document '{}'", doc_name);
-                        }
-
-                        {
-                            let mut pending = persist_pending.lock().await;
-                            *pending = false;
-                        }
-
-                        let latest_request = {
-                            let last_request = last_persist_request.lock().await;
-                            *last_request
-                        };
-
-                        if latest_request == Some(persisted_request) {
-                            break;
-                        }
-
-                        let mut pending = persist_pending.lock().await;
-                        if *pending {
-                            break;
-                        }
-                        *pending = true;
-                    }
-                });
-            }
+            });
         }
     }
 
@@ -664,6 +822,8 @@ impl DocHandler {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sqlite")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "sqlite")]
     use yrs::encoding::read::Read;
     #[cfg(feature = "sqlite")]
@@ -741,8 +901,9 @@ mod tests {
     fn repair_text(handler: &DocHandler) -> String {
         let doc = handler.doc.lock().unwrap();
         let txn = doc.transact();
-        let text = txn.get_text("repair").unwrap();
-        text.get_string(&txn)
+        txn.get_text("repair")
+            .map(|text| text.get_string(&txn))
+            .unwrap_or_default()
     }
 
     #[cfg(feature = "sqlite")]
@@ -934,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "sqlite")]
-    async fn test_update_hook_returns_repair_update_to_sender() {
+    async fn test_update_hook_acknowledges_before_debounced_repair() {
         let db = create_test_db().await;
         let handler = DocHandler::new_with_update_hook(
             "test-room".to_string(),
@@ -942,6 +1103,7 @@ mod tests {
             Some(single_repair_hook()),
         )
         .await;
+        let mut rx = handler.subscribe();
 
         let client_doc = Doc::new();
         let update = {
@@ -955,18 +1117,26 @@ mod tests {
         let msg = encode_test_msg("test-room", MSG_SYNC, &payload);
         let responses = handler.handle_message(&msg).await;
 
-        assert_eq!(responses.len(), 2);
+        assert_eq!(responses.len(), 1);
         assert!(
             responses
                 .iter()
                 .any(|response| is_applied_sync_status(response)),
             "sender should receive a syncStatus ack after the update is applied"
         );
-        let repair_response = responses
-            .iter()
-            .find(|response| !is_applied_sync_status(response))
+        assert_eq!(repair_text(&handler), "");
+
+        let original = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
             .unwrap();
-        let repair_update = extract_sync_update(repair_response);
+        assert_eq!(extract_sync_update(&original), update);
+
+        let repair_response = tokio::time::timeout(Duration::from_millis(1000), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let repair_update = extract_sync_update(&repair_response);
         let receiver_doc = Doc::new();
         {
             let mut txn = receiver_doc.transact_mut();
@@ -979,7 +1149,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "sqlite")]
-    async fn test_update_hook_repair_is_broadcast_and_persisted() {
+    async fn test_update_hook_repair_is_debounced_broadcast_and_persisted() {
         let db = create_test_db().await;
         let handler = DocHandler::new_with_update_hook(
             "hook-room".to_string(),
@@ -1005,7 +1175,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let repair = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        let repair = tokio::time::timeout(Duration::from_millis(1000), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1021,6 +1191,40 @@ mod tests {
         handler.force_persist().await;
         let reloaded = DocHandler::new("hook-room".to_string(), db).await;
         assert_eq!(repair_text(&reloaded), "fixed");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_update_hook_coalesces_multiple_small_updates() {
+        let db = create_test_db().await;
+        let hook_runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let hook_runs_for_hook = hook_runs.clone();
+        let hook: UpdateHook = std::sync::Arc::new(move |_txn| {
+            hook_runs_for_hook.fetch_add(1, Ordering::SeqCst);
+            0
+        });
+        let handler =
+            DocHandler::new_with_update_hook("coalesce-room".to_string(), db, Some(hook)).await;
+
+        let client_doc = Doc::new();
+        let text = client_doc.get_or_insert_text("content");
+
+        for value in ["a", "b", "c", "d", "e"] {
+            let update = {
+                let mut txn = client_doc.transact_mut();
+                text.push(&mut txn, value);
+                txn.encode_update_v1()
+            };
+            let msg = encode_test_msg("coalesce-room", MSG_SYNC, &encode_update(&update));
+            handler.handle_message(&msg).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(UPDATE_HOOK_DEBOUNCE_MS * 2)).await;
+        assert_eq!(
+            hook_runs.load(Ordering::SeqCst),
+            1,
+            "rapid content updates should share one repair hook run"
+        );
     }
 
     #[tokio::test]
