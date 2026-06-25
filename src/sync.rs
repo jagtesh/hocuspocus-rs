@@ -14,7 +14,7 @@
 #[cfg(feature = "sqlite")]
 use std::sync::Arc;
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
-use tokio::sync::{broadcast, Mutex as TokioMutex};
+use tokio::sync::{broadcast, Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio::time::{Duration, Instant};
 use yrs::encoding::read::Read;
 use yrs::encoding::write::Write;
@@ -55,11 +55,34 @@ pub fn named_update_hook(hook: UpdateHook) -> NamedUpdateHook {
     StdArc::new(move |_doc_name, txn| hook(txn))
 }
 
+pub type HandlerError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Persistence behavior for server-originated transactions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPersistence {
+    /// Broadcast the update and let the normal debounced persistence worker save it.
+    Debounced,
+    /// Save the canonical document row before returning to the caller.
+    Immediate,
+}
+
 #[derive(Default)]
 struct UpdateHookSchedulerState {
     running: bool,
     dirty: bool,
     coalesced_updates: u64,
+}
+
+/// A per-room critical section for server-side code that must coordinate
+/// application SQL changes with Yjs rewrites.
+///
+/// Notella REST writes should acquire this guard, make their Notella SQL change,
+/// then call [`RoomWriteGuard::transact_and_broadcast_persisted`] before
+/// returning. Inbound WebSocket updates, debounced persistence, update hooks,
+/// and server-originated transactions share the same room gate.
+pub struct RoomWriteGuard<'a> {
+    handler: &'a DocHandler,
+    _guard: TokioMutexGuard<'a, ()>,
 }
 
 /// A handler for a single Yjs document/room
@@ -71,6 +94,8 @@ pub struct DocHandler {
     pub doc_name: String,
     /// Thread-safe document access using std Mutex (Doc ops are sync & fast)
     doc: StdArc<StdMutex<Doc>>,
+    /// Async room-level write gate for coordinating Yjs state with app SQL.
+    room_lock: StdArc<TokioMutex<()>>,
     /// Database for persistence
     #[cfg(feature = "sqlite")]
     db: Database,
@@ -142,6 +167,7 @@ impl DocHandler {
         Self {
             doc_name,
             doc: StdArc::new(StdMutex::new(doc)),
+            room_lock: StdArc::new(TokioMutex::new(())),
             db,
             broadcast_tx,
             update_hook,
@@ -174,6 +200,7 @@ impl DocHandler {
         Self {
             doc_name,
             doc: StdArc::new(StdMutex::new(doc)),
+            room_lock: StdArc::new(TokioMutex::new(())),
             broadcast_tx,
             update_hook,
             update_hook_scheduler: StdArc::new(
@@ -429,7 +456,12 @@ impl DocHandler {
                                 continue;
                             }
 
-                            if let Err(e) = self.apply_update(update_data) {
+                            let apply_result = {
+                                let _room_guard = self.room_lock.lock().await;
+                                self.apply_update_unlocked(update_data)
+                            };
+
+                            if let Err(e) = apply_result {
                                 tracing::error!(
                                     "Failed to apply SyncStep2 update: {:?}. Payload: {:02x?}",
                                     e,
@@ -462,7 +494,12 @@ impl DocHandler {
                                 update_bytes = update_data.len(),
                                 "handling incremental update"
                             );
-                            if let Err(e) = self.apply_update(update_data) {
+                            let apply_result = {
+                                let _room_guard = self.room_lock.lock().await;
+                                self.apply_update_unlocked(update_data)
+                            };
+
+                            if let Err(e) = apply_result {
                                 tracing::error!("Failed to apply incremental update: {:?}", e);
                             } else {
                                 tracing::debug!(
@@ -522,15 +559,20 @@ impl DocHandler {
         }
     }
 
-    /// Apply a server-originated transaction, broadcast its Yjs update to peers,
-    /// and request persistence. Returns the encoded update when the closure
-    /// reports that it changed the document.
-    pub async fn transact_and_broadcast<F>(
-        &self,
-        f: F,
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>
+    /// Acquire the room-level write gate.
+    ///
+    /// Use this when server code needs a single critical section spanning
+    /// application SQL changes and a Yjs rewrite for the same room.
+    pub async fn lock_room(&self) -> RoomWriteGuard<'_> {
+        RoomWriteGuard {
+            handler: self,
+            _guard: self.room_lock.lock().await,
+        }
+    }
+
+    fn transact_unlocked<F>(&self, f: F) -> Option<Vec<u8>>
     where
-        F: FnOnce(&mut TransactionMut) -> usize + Send,
+        F: FnOnce(&mut TransactionMut) -> usize,
     {
         let update = {
             let doc = self.doc.lock().unwrap_or_else(|e| {
@@ -555,14 +597,74 @@ impl DocHandler {
             }
         };
 
+        update
+    }
+
+    async fn transact_and_broadcast_unlocked<F>(
+        &self,
+        f: F,
+        persistence: TransactionPersistence,
+    ) -> Result<Option<Vec<u8>>, HandlerError>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        let update = self.transact_unlocked(f);
+
         if let Some(update) = update {
             self.broadcast_sync_update(&update);
             self.schedule_update_hook().await;
-            self.request_persist().await;
+            match persistence {
+                TransactionPersistence::Debounced => self.request_persist().await,
+                TransactionPersistence::Immediate => self.persist_current_state_unlocked().await?,
+            }
             Ok(Some(update))
         } else {
             Ok(None)
         }
+    }
+
+    /// Apply a server-originated transaction, broadcast its Yjs update to peers,
+    /// and request debounced persistence. Returns the encoded update when the
+    /// closure reports that it changed the document.
+    pub async fn transact_and_broadcast<F>(&self, f: F) -> Result<Option<Vec<u8>>, HandlerError>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        self.transact_and_broadcast_with_persistence(f, TransactionPersistence::Debounced)
+            .await
+    }
+
+    /// Apply a server-originated transaction with explicit persistence behavior.
+    ///
+    /// Use [`TransactionPersistence::Immediate`] for REST writes that must not
+    /// return before the canonical `documents` row is durable. For multi-step
+    /// Notella writes, prefer [`DocHandler::lock_room`] and call the matching
+    /// method on [`RoomWriteGuard`] after the application SQL mutation.
+    pub async fn transact_and_broadcast_with_persistence<F>(
+        &self,
+        f: F,
+        persistence: TransactionPersistence,
+    ) -> Result<Option<Vec<u8>>, HandlerError>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        let guard = self.lock_room().await;
+        guard
+            .transact_and_broadcast_with_persistence(f, persistence)
+            .await
+    }
+
+    /// Apply a server-originated transaction and persist the full document state
+    /// before returning.
+    pub async fn transact_and_broadcast_persisted<F>(
+        &self,
+        f: F,
+    ) -> Result<Option<Vec<u8>>, HandlerError>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        self.transact_and_broadcast_with_persistence(f, TransactionPersistence::Immediate)
+            .await
     }
 
     /// Return the full current document state encoded as a Yjs update.
@@ -642,6 +744,7 @@ impl DocHandler {
         scheduler.running = true;
         let doc_name = self.doc_name.clone();
         let doc = self.doc.clone();
+        let room_lock = self.room_lock.clone();
         let broadcast_tx = self.broadcast_tx.clone();
         let scheduler_state = self.update_hook_scheduler.clone();
         #[cfg(feature = "sqlite")]
@@ -675,7 +778,10 @@ impl DocHandler {
                     "running update hook"
                 );
 
-                let repair_update = Self::run_update_hook_for(&doc_name, &doc, &hook);
+                let repair_update = {
+                    let _room_guard = room_lock.lock().await;
+                    Self::run_update_hook_for(&doc_name, &doc, &hook)
+                };
 
                 if let Some(repair_update) = repair_update {
                     let msg = Self::encode_hocuspocus_sync_update(&doc_name, &repair_update);
@@ -700,6 +806,7 @@ impl DocHandler {
                             doc_name.clone(),
                             db.clone(),
                             doc.clone(),
+                            room_lock.clone(),
                             last_persist_request.clone(),
                             persist_pending.clone(),
                         )
@@ -739,11 +846,17 @@ impl DocHandler {
         encoded
     }
 
-    /// Apply a Yjs update to the document
-    pub fn apply_update(
-        &self,
-        update_data: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Apply a Yjs update to the document.
+    ///
+    /// This is a low-level synchronous helper. Async server paths should prefer
+    /// [`DocHandler::handle_message`], [`DocHandler::transact_and_broadcast`],
+    /// or [`DocHandler::lock_room`] so Yjs changes participate in the room
+    /// critical section.
+    pub fn apply_update(&self, update_data: &[u8]) -> Result<(), HandlerError> {
+        self.apply_update_unlocked(update_data)
+    }
+
+    fn apply_update_unlocked(&self, update_data: &[u8]) -> Result<(), HandlerError> {
         let started = Instant::now();
         let update = Update::decode_v1(update_data)?;
         let doc = self.doc.lock().unwrap_or_else(|e| {
@@ -769,6 +882,7 @@ impl DocHandler {
                 self.doc_name.clone(),
                 self.db.clone(),
                 self.doc.clone(),
+                self.room_lock.clone(),
                 self.last_persist_request.clone(),
                 self.persist_pending.clone(),
             )
@@ -781,6 +895,7 @@ impl DocHandler {
         doc_name: String,
         db: Database,
         doc: StdArc<StdMutex<Doc>>,
+        room_lock: StdArc<TokioMutex<()>>,
         last_persist_request: Arc<TokioMutex<Option<Instant>>>,
         persist_pending: Arc<TokioMutex<bool>>,
     ) {
@@ -825,16 +940,23 @@ impl DocHandler {
                         tokio::time::sleep(sleep_for).await;
                     };
 
-                    let state = {
-                        let doc = doc.lock().unwrap_or_else(|e| {
-                            tracing::warn!("Doc mutex was poisoned for '{}', recovering", doc_name);
-                            e.into_inner()
-                        });
-                        let txn = doc.transact();
-                        txn.encode_state_as_update_v1(&StateVector::default())
+                    let persist_result = {
+                        let _room_guard = room_lock.lock().await;
+                        let state = {
+                            let doc = doc.lock().unwrap_or_else(|e| {
+                                tracing::warn!(
+                                    "Doc mutex was poisoned for '{}', recovering",
+                                    doc_name
+                                );
+                                e.into_inner()
+                            });
+                            let txn = doc.transact();
+                            txn.encode_state_as_update_v1(&StateVector::default())
+                        };
+                        db.save_doc(&doc_name, state).await
                     };
 
-                    if let Err(e) = db.save_doc(&doc_name, state).await {
+                    if let Err(e) = persist_result {
                         tracing::error!("Failed to persist document '{}': {:?}", doc_name, e);
                     } else {
                         tracing::debug!("Persisted document '{}'", doc_name);
@@ -864,8 +986,7 @@ impl DocHandler {
         }
     }
 
-    /// Force immediate persistence (for graceful shutdown)
-    pub async fn force_persist(&self) {
+    async fn persist_current_state_unlocked(&self) -> Result<(), HandlerError> {
         #[cfg(feature = "sqlite")]
         {
             let state = {
@@ -877,21 +998,88 @@ impl DocHandler {
                 txn.encode_state_as_update_v1(&StateVector::default())
             };
 
-            if let Err(e) = self.db.save_doc(&self.doc_name, state).await {
-                tracing::error!(
-                    "Failed to persist document '{}' on shutdown: {:?}",
-                    self.doc_name,
-                    e
-                );
-            } else {
-                tracing::info!("Persisted document '{}' on shutdown", self.doc_name);
-            }
+            self.db
+                .save_doc(&self.doc_name, state)
+                .await
+                .map_err(|e| -> HandlerError { Box::new(e) })?;
+        }
+
+        Ok(())
+    }
+
+    /// Persist the full current document state immediately.
+    pub async fn persist_now(&self) -> Result<(), HandlerError> {
+        let _room_guard = self.room_lock.lock().await;
+        self.persist_current_state_unlocked().await
+    }
+
+    /// Force immediate persistence (for graceful shutdown)
+    pub async fn force_persist(&self) {
+        if let Err(e) = self.persist_now().await {
+            tracing::error!(
+                "Failed to persist document '{}' on shutdown: {:?}",
+                self.doc_name,
+                e
+            );
+        } else {
+            tracing::info!("Persisted document '{}' on shutdown", self.doc_name);
         }
     }
 
     /// Get a subscription to broadcast messages
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
         self.broadcast_tx.subscribe()
+    }
+}
+
+impl RoomWriteGuard<'_> {
+    /// Apply a server-originated transaction while holding the room gate,
+    /// broadcast its update, and request debounced persistence.
+    pub async fn transact_and_broadcast<F>(&self, f: F) -> Result<Option<Vec<u8>>, HandlerError>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        self.transact_and_broadcast_with_persistence(f, TransactionPersistence::Debounced)
+            .await
+    }
+
+    /// Apply a server-originated transaction while holding the room gate with
+    /// explicit persistence behavior.
+    pub async fn transact_and_broadcast_with_persistence<F>(
+        &self,
+        f: F,
+        persistence: TransactionPersistence,
+    ) -> Result<Option<Vec<u8>>, HandlerError>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        self.handler
+            .transact_and_broadcast_unlocked(f, persistence)
+            .await
+    }
+
+    /// Apply a server-originated transaction and persist the full document state
+    /// before returning, without releasing the room gate.
+    pub async fn transact_and_broadcast_persisted<F>(
+        &self,
+        f: F,
+    ) -> Result<Option<Vec<u8>>, HandlerError>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        self.transact_and_broadcast_with_persistence(f, TransactionPersistence::Immediate)
+            .await
+    }
+
+    /// Return the full current document state encoded as a Yjs update while the
+    /// caller holds the room gate.
+    pub fn encode_state_as_update(&self) -> Vec<u8> {
+        self.handler.encode_state_as_update()
+    }
+
+    /// Persist the current document state without releasing the room gate.
+    pub async fn persist_now(&self) -> Result<(), HandlerError> {
+        self.handler.persist_current_state_unlocked().await
     }
 }
 
@@ -976,9 +1164,14 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     fn repair_text(handler: &DocHandler) -> String {
+        doc_text(handler, "repair")
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn doc_text(handler: &DocHandler, name: &str) -> String {
         let doc = handler.doc.lock().unwrap();
         let txn = doc.transact();
-        txn.get_text("repair")
+        txn.get_text(name)
             .map(|text| text.get_string(&txn))
             .unwrap_or_default()
     }
@@ -1119,6 +1312,125 @@ mod tests {
         let saved = db.get_doc("test-room").await.unwrap();
         assert!(saved.is_some());
         assert!(!saved.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_server_transaction_can_persist_immediately() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("rest-room".to_string(), db.clone()).await;
+        let mut rx = handler.subscribe();
+
+        let update = handler
+            .transact_and_broadcast_persisted(|txn| {
+                let text = txn.get_or_insert_text("content");
+                text.push(txn, "REST data");
+                1
+            })
+            .await
+            .unwrap();
+
+        assert!(update.is_some());
+        let broadcast = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            DocHandler::read_and_skip_doc_name(&broadcast).unwrap().1,
+            "rest-room"
+        );
+
+        let saved = db.get_doc("rest-room").await.unwrap();
+        assert!(
+            saved.is_some(),
+            "immediate mode should save before returning"
+        );
+
+        let reloaded = DocHandler::new("rest-room".to_string(), db).await;
+        assert_eq!(doc_text(&reloaded, "content"), "REST data");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_immediate_persist_is_not_overwritten_by_pending_debounce() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("ordered-room".to_string(), db.clone()).await;
+        let client_doc = Doc::new();
+        let text = client_doc.get_or_insert_text("content");
+
+        let client_update = {
+            let mut txn = client_doc.transact_mut();
+            text.push(&mut txn, "client");
+            txn.encode_update_v1()
+        };
+        let msg = encode_test_msg("ordered-room", MSG_SYNC, &encode_update(&client_update));
+        handler.handle_message(&msg).await;
+
+        handler
+            .transact_and_broadcast_persisted(|txn| {
+                let text = txn.get_or_insert_text("content");
+                text.push(txn, "rest");
+                1
+            })
+            .await
+            .unwrap();
+
+        let reloaded = DocHandler::new("ordered-room".to_string(), db.clone()).await;
+        assert_eq!(doc_text(&reloaded, "content"), "clientrest");
+
+        tokio::time::sleep(Duration::from_millis(PERSIST_DEBOUNCE_MS * 2 + 250)).await;
+
+        let reloaded_after_debounce = DocHandler::new("ordered-room".to_string(), db).await;
+        assert_eq!(doc_text(&reloaded_after_debounce, "content"), "clientrest");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_room_write_guard_blocks_inbound_updates() {
+        let db = create_test_db().await;
+        let handler = std::sync::Arc::new(DocHandler::new("locked-room".to_string(), db).await);
+        let guard = handler.lock_room().await;
+
+        let client_doc = Doc::new();
+        let update = {
+            let text = client_doc.get_or_insert_text("content");
+            let mut txn = client_doc.transact_mut();
+            text.push(&mut txn, "client");
+            txn.encode_update_v1()
+        };
+        let msg = encode_test_msg("locked-room", MSG_SYNC, &encode_update(&update));
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let handler_for_task = handler.clone();
+        tokio::spawn(async move {
+            handler_for_task.handle_message(&msg).await;
+            let _ = tx.send(());
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        guard
+            .transact_and_broadcast_persisted(|txn| {
+                let text = txn.get_or_insert_text("content");
+                text.push(txn, "server");
+                1
+            })
+            .await
+            .unwrap();
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_millis(1000), rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let text = doc_text(&handler, "content");
+        assert!(text.contains("server"));
+        assert!(text.contains("client"));
     }
 
     #[tokio::test]

@@ -10,7 +10,8 @@ pub mod sync;
 #[cfg(feature = "sqlite")]
 pub use db::Database;
 pub use sync::{
-    DocHandler, NamedUpdateHook, UpdateHook, MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC,
+    DocHandler, HandlerError, NamedUpdateHook, RoomWriteGuard, TransactionPersistence, UpdateHook,
+    MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC,
 };
 
 #[cfg(feature = "server")]
@@ -166,11 +167,7 @@ async fn handle_socket_generic(socket: WebSocket, state: Arc<AppState>) {
     // Process initial message
     let responses = handler.handle_message(&first_msg).await;
     for resp in &responses {
-        if sender
-            .send(Message::Binary(resp.clone().into()))
-            .await
-            .is_err()
-        {
+        if sender.send(Message::Binary(resp.clone())).await.is_err() {
             return;
         }
     }
@@ -196,7 +193,7 @@ pub async fn run_connection(
     // Send initial sync
     let initial_msgs = handler.generate_initial_sync();
     for msg in initial_msgs {
-        if ws_sender.send(Message::Binary(msg.into())).await.is_err() {
+        if ws_sender.send(Message::Binary(msg)).await.is_err() {
             return;
         }
     }
@@ -210,7 +207,7 @@ pub async fn run_connection(
                     Some(Ok(Message::Binary(data))) => {
                         let responses = handler.handle_message(&data).await;
                         for resp in responses {
-                            if ws_sender.send(Message::Binary(resp.into())).await.is_err() {
+                            if ws_sender.send(Message::Binary(resp)).await.is_err() {
                                 return;
                             }
                         }
@@ -231,7 +228,7 @@ pub async fn run_connection(
             }
             msg = broadcast_rx.recv() => {
                 if let Ok(data) = msg {
-                    if ws_sender.send(Message::Binary(data.into())).await.is_err() {
+                    if ws_sender.send(Message::Binary(data)).await.is_err() {
                         return;
                     }
                 }
