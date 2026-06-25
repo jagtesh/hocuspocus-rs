@@ -101,8 +101,10 @@ pub struct DocHandler {
     db: Database,
     /// Broadcast channel for sending updates to other clients
     pub broadcast_tx: broadcast::Sender<Vec<u8>>,
+    /// Optional hook that runs immediately after inbound client updates.
+    immediate_update_hook: Option<NamedUpdateHook>,
     /// Optional application-level invariant repair hook.
-    update_hook: Option<NamedUpdateHook>,
+    debounced_update_hook: Option<NamedUpdateHook>,
     /// Coalesces repair hook work so incremental content updates stay cheap.
     update_hook_scheduler: StdArc<TokioMutex<UpdateHookSchedulerState>>,
     /// Track when persistence was last requested for debouncing
@@ -139,6 +141,16 @@ impl DocHandler {
         db: Database,
         update_hook: Option<NamedUpdateHook>,
     ) -> Self {
+        Self::new_with_named_hooks(doc_name, db, None, update_hook).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub async fn new_with_named_hooks(
+        doc_name: String,
+        db: Database,
+        immediate_update_hook: Option<NamedUpdateHook>,
+        debounced_update_hook: Option<NamedUpdateHook>,
+    ) -> Self {
         let doc = Doc::new();
         let (broadcast_tx, _) = broadcast::channel(256);
 
@@ -170,7 +182,8 @@ impl DocHandler {
             room_lock: StdArc::new(TokioMutex::new(())),
             db,
             broadcast_tx,
-            update_hook,
+            immediate_update_hook,
+            debounced_update_hook,
             update_hook_scheduler: StdArc::new(
                 TokioMutex::new(UpdateHookSchedulerState::default()),
             ),
@@ -194,6 +207,15 @@ impl DocHandler {
         doc_name: String,
         update_hook: Option<NamedUpdateHook>,
     ) -> Self {
+        Self::new_with_named_hooks(doc_name, None, update_hook).await
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    pub async fn new_with_named_hooks(
+        doc_name: String,
+        immediate_update_hook: Option<NamedUpdateHook>,
+        debounced_update_hook: Option<NamedUpdateHook>,
+    ) -> Self {
         let doc = Doc::new();
         let (broadcast_tx, _) = broadcast::channel(256);
 
@@ -202,7 +224,8 @@ impl DocHandler {
             doc: StdArc::new(StdMutex::new(doc)),
             room_lock: StdArc::new(TokioMutex::new(())),
             broadcast_tx,
-            update_hook,
+            immediate_update_hook,
+            debounced_update_hook,
             update_hook_scheduler: StdArc::new(
                 TokioMutex::new(UpdateHookSchedulerState::default()),
             ),
@@ -458,25 +481,35 @@ impl DocHandler {
 
                             let apply_result = {
                                 let _room_guard = self.room_lock.lock().await;
-                                self.apply_update_unlocked(update_data)
+                                let apply_result = self.apply_update_unlocked(update_data);
+                                match apply_result {
+                                    Ok(()) => Ok(self.run_immediate_update_hook_unlocked()),
+                                    Err(error) => Err(error),
+                                }
                             };
 
-                            if let Err(e) = apply_result {
-                                tracing::error!(
-                                    "Failed to apply SyncStep2 update: {:?}. Payload: {:02x?}",
-                                    e,
-                                    update_data
-                                );
-                            } else {
-                                tracing::debug!(
-                                    doc = %self.doc_name,
-                                    update_bytes = update_data.len(),
-                                    "applied SyncStep2 update"
-                                );
-                                self.broadcast_sync_update(update_data);
-                                self.schedule_update_hook().await;
-                                responses.push(self.encode_sync_status(true));
-                                self.request_persist().await;
+                            match apply_result {
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to apply SyncStep2 update: {:?}. Payload: {:02x?}",
+                                        e,
+                                        update_data
+                                    );
+                                }
+                                Ok(immediate_update) => {
+                                    tracing::debug!(
+                                        doc = %self.doc_name,
+                                        update_bytes = update_data.len(),
+                                        "applied SyncStep2 update"
+                                    );
+                                    self.broadcast_sync_update(update_data);
+                                    if let Some(immediate_update) = immediate_update {
+                                        self.broadcast_sync_update(&immediate_update);
+                                    }
+                                    self.schedule_update_hook().await;
+                                    responses.push(self.encode_sync_status(true));
+                                    self.request_persist().await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -496,22 +529,32 @@ impl DocHandler {
                             );
                             let apply_result = {
                                 let _room_guard = self.room_lock.lock().await;
-                                self.apply_update_unlocked(update_data)
+                                let apply_result = self.apply_update_unlocked(update_data);
+                                match apply_result {
+                                    Ok(()) => Ok(self.run_immediate_update_hook_unlocked()),
+                                    Err(error) => Err(error),
+                                }
                             };
 
-                            if let Err(e) = apply_result {
-                                tracing::error!("Failed to apply incremental update: {:?}", e);
-                            } else {
-                                tracing::debug!(
-                                    doc = %self.doc_name,
-                                    update_bytes = update_data.len(),
-                                    "applied incremental update"
-                                );
+                            match apply_result {
+                                Err(e) => {
+                                    tracing::error!("Failed to apply incremental update: {:?}", e);
+                                }
+                                Ok(immediate_update) => {
+                                    tracing::debug!(
+                                        doc = %self.doc_name,
+                                        update_bytes = update_data.len(),
+                                        "applied incremental update"
+                                    );
 
-                                self.broadcast_sync_update(update_data);
-                                self.schedule_update_hook().await;
-                                responses.push(self.encode_sync_status(true));
-                                self.request_persist().await;
+                                    self.broadcast_sync_update(update_data);
+                                    if let Some(immediate_update) = immediate_update {
+                                        self.broadcast_sync_update(&immediate_update);
+                                    }
+                                    self.schedule_update_hook().await;
+                                    responses.push(self.encode_sync_status(true));
+                                    self.request_persist().await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -677,6 +720,19 @@ impl DocHandler {
         txn.encode_state_as_update_v1(&StateVector::default())
     }
 
+    /// Subscribe before encoding initial sync, so broadcasts that happen while
+    /// the caller is sending initial messages are queued for this connection.
+    pub fn subscribe_with_initial_sync(&self) -> (broadcast::Receiver<Vec<u8>>, Vec<Vec<u8>>) {
+        let broadcast_rx = self.subscribe();
+        let initial_msgs = self.generate_initial_sync();
+        (broadcast_rx, initial_msgs)
+    }
+
+    fn run_immediate_update_hook_unlocked(&self) -> Option<Vec<u8>> {
+        let hook = self.immediate_update_hook.as_ref()?;
+        Self::run_update_hook_for(&self.doc_name, &self.doc, hook)
+    }
+
     fn run_update_hook_for(
         doc_name: &str,
         doc: &StdArc<StdMutex<Doc>>,
@@ -724,7 +780,7 @@ impl DocHandler {
     }
 
     async fn schedule_update_hook(&self) {
-        let Some(hook) = self.update_hook.clone() else {
+        let Some(hook) = self.debounced_update_hook.clone() else {
             return;
         };
 
@@ -1352,6 +1408,33 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "sqlite")]
+    async fn test_initial_sync_subscription_queues_setup_broadcasts() {
+        let db = create_test_db().await;
+        let handler = DocHandler::new("connect-room".to_string(), db).await;
+        let (mut rx, initial_msgs) = handler.subscribe_with_initial_sync();
+        assert_eq!(initial_msgs.len(), 1);
+
+        handler
+            .transact_and_broadcast_persisted(|txn| {
+                let text = txn.get_or_insert_text("content");
+                text.push(txn, "during connect");
+                1
+            })
+            .await
+            .unwrap();
+
+        let broadcast = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            DocHandler::read_and_skip_doc_name(&broadcast).unwrap().1,
+            "connect-room"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
     async fn test_immediate_persist_is_not_overwritten_by_pending_debounce() {
         let db = create_test_db().await;
         let handler = DocHandler::new("ordered-room".to_string(), db.clone()).await;
@@ -1533,6 +1616,50 @@ mod tests {
         }
         let repair = receiver_doc.get_or_insert_text("repair");
         assert_eq!(repair.get_string(&receiver_doc.transact()), "fixed");
+        assert_eq!(repair_text(&handler), "fixed");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_immediate_hook_runs_before_debounced_repair() {
+        let db = create_test_db().await;
+        let immediate_runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let immediate_runs_for_hook = immediate_runs.clone();
+        let immediate_hook: NamedUpdateHook = std::sync::Arc::new(move |_room, txn| {
+            immediate_runs_for_hook.fetch_add(1, Ordering::SeqCst);
+            let text = txn.get_or_insert_text("immediate");
+            if text.get_string(txn).is_empty() {
+                text.push(txn, "projected");
+                1
+            } else {
+                0
+            }
+        });
+        let handler = DocHandler::new_with_named_hooks(
+            "immediate-room".to_string(),
+            db,
+            Some(immediate_hook),
+            Some(named_update_hook(single_repair_hook())),
+        )
+        .await;
+
+        let client_doc = Doc::new();
+        let update = {
+            let text = client_doc.get_or_insert_text("content");
+            let mut txn = client_doc.transact_mut();
+            text.push(&mut txn, "client data");
+            txn.encode_update_v1()
+        };
+
+        let msg = encode_test_msg("immediate-room", MSG_SYNC, &encode_update(&update));
+        let responses = handler.handle_message(&msg).await;
+
+        assert!(responses.iter().any(|response| is_applied_sync_status(response)));
+        assert_eq!(immediate_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(doc_text(&handler, "immediate"), "projected");
+        assert_eq!(repair_text(&handler), "");
+
+        tokio::time::sleep(Duration::from_millis(UPDATE_HOOK_DEBOUNCE_MS * 2)).await;
         assert_eq!(repair_text(&handler), "fixed");
     }
 

@@ -40,7 +40,8 @@ pub struct AppState {
     pub rooms: DashMap<String, Arc<DocHandler>>,
     #[cfg(feature = "sqlite")]
     pub db: Database,
-    update_hook: Option<NamedUpdateHook>,
+    immediate_update_hook: Option<NamedUpdateHook>,
+    debounced_update_hook: Option<NamedUpdateHook>,
 }
 
 #[cfg(feature = "server")]
@@ -57,10 +58,20 @@ impl AppState {
 
     #[cfg(feature = "sqlite")]
     pub fn new_with_named_update_hook(db: Database, update_hook: Option<NamedUpdateHook>) -> Self {
+        Self::new_with_named_hooks(db, None, update_hook)
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub fn new_with_named_hooks(
+        db: Database,
+        immediate_update_hook: Option<NamedUpdateHook>,
+        debounced_update_hook: Option<NamedUpdateHook>,
+    ) -> Self {
         Self {
             rooms: DashMap::new(),
             db,
-            update_hook,
+            immediate_update_hook,
+            debounced_update_hook,
         }
     }
 
@@ -76,9 +87,18 @@ impl AppState {
 
     #[cfg(not(feature = "sqlite"))]
     pub fn new_with_named_update_hook(update_hook: Option<NamedUpdateHook>) -> Self {
+        Self::new_with_named_hooks(None, update_hook)
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    pub fn new_with_named_hooks(
+        immediate_update_hook: Option<NamedUpdateHook>,
+        debounced_update_hook: Option<NamedUpdateHook>,
+    ) -> Self {
         Self {
             rooms: DashMap::new(),
-            update_hook,
+            immediate_update_hook,
+            debounced_update_hook,
         }
     }
 
@@ -89,28 +109,41 @@ impl AppState {
             .or_insert_with(|| {
                 let name = room_name.to_string();
                 #[cfg(feature = "sqlite")]
-                {
-                    let db = self.db.clone();
-                    let update_hook = self.update_hook.clone();
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            Arc::new(
-                                DocHandler::new_with_named_update_hook(name, db, update_hook).await,
-                            )
+                    {
+                        let db = self.db.clone();
+                        let immediate_update_hook = self.immediate_update_hook.clone();
+                        let debounced_update_hook = self.debounced_update_hook.clone();
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                Arc::new(
+                                    DocHandler::new_with_named_hooks(
+                                        name,
+                                        db,
+                                        immediate_update_hook,
+                                        debounced_update_hook,
+                                    )
+                                    .await,
+                                )
+                            })
                         })
-                    })
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
-                    let update_hook = self.update_hook.clone();
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            Arc::new(
-                                DocHandler::new_with_named_update_hook(name, update_hook).await,
-                            )
+                    }
+                    #[cfg(not(feature = "sqlite"))]
+                    {
+                        let immediate_update_hook = self.immediate_update_hook.clone();
+                        let debounced_update_hook = self.debounced_update_hook.clone();
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                Arc::new(
+                                    DocHandler::new_with_named_hooks(
+                                        name,
+                                        immediate_update_hook,
+                                        debounced_update_hook,
+                                    )
+                                    .await,
+                                )
+                            })
                         })
-                    })
-                }
+                    }
             })
             .clone()
     }
@@ -190,15 +223,14 @@ pub async fn run_connection(
     room_name: String,
     _initial_message: Option<Vec<u8>>,
 ) {
-    // Send initial sync
-    let initial_msgs = handler.generate_initial_sync();
+    // Subscribe before sending initial sync so broadcasts during connection
+    // setup are queued and delivered after the initial messages.
+    let (mut broadcast_rx, initial_msgs) = handler.subscribe_with_initial_sync();
     for msg in initial_msgs {
         if ws_sender.send(Message::Binary(msg)).await.is_err() {
             return;
         }
     }
-
-    let mut broadcast_rx = handler.subscribe();
 
     loop {
         tokio::select! {
