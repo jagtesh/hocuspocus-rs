@@ -48,6 +48,13 @@ const UPDATE_HOOK_DEBOUNCE_MS: u64 = 250;
 /// broadcast to peers, and included in persistence.
 pub type UpdateHook = StdArc<dyn Fn(&mut TransactionMut) -> usize + Send + Sync>;
 
+/// Like [`UpdateHook`], but receives the document/room name.
+pub type NamedUpdateHook = StdArc<dyn Fn(&str, &mut TransactionMut) -> usize + Send + Sync>;
+
+pub fn named_update_hook(hook: UpdateHook) -> NamedUpdateHook {
+    StdArc::new(move |_doc_name, txn| hook(txn))
+}
+
 #[derive(Default)]
 struct UpdateHookSchedulerState {
     running: bool,
@@ -70,7 +77,7 @@ pub struct DocHandler {
     /// Broadcast channel for sending updates to other clients
     pub broadcast_tx: broadcast::Sender<Vec<u8>>,
     /// Optional application-level invariant repair hook.
-    update_hook: Option<UpdateHook>,
+    update_hook: Option<NamedUpdateHook>,
     /// Coalesces repair hook work so incremental content updates stay cheap.
     update_hook_scheduler: StdArc<TokioMutex<UpdateHookSchedulerState>>,
     /// Track when persistence was last requested for debouncing
@@ -97,6 +104,15 @@ impl DocHandler {
         doc_name: String,
         db: Database,
         update_hook: Option<UpdateHook>,
+    ) -> Self {
+        Self::new_with_named_update_hook(doc_name, db, update_hook.map(named_update_hook)).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub async fn new_with_named_update_hook(
+        doc_name: String,
+        db: Database,
+        update_hook: Option<NamedUpdateHook>,
     ) -> Self {
         let doc = Doc::new();
         let (broadcast_tx, _) = broadcast::channel(256);
@@ -144,6 +160,14 @@ impl DocHandler {
 
     #[cfg(not(feature = "sqlite"))]
     pub async fn new_with_update_hook(doc_name: String, update_hook: Option<UpdateHook>) -> Self {
+        Self::new_with_named_update_hook(doc_name, update_hook.map(named_update_hook)).await
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    pub async fn new_with_named_update_hook(
+        doc_name: String,
+        update_hook: Option<NamedUpdateHook>,
+    ) -> Self {
         let doc = Doc::new();
         let (broadcast_tx, _) = broadcast::channel(256);
 
@@ -498,10 +522,63 @@ impl DocHandler {
         }
     }
 
+    /// Apply a server-originated transaction, broadcast its Yjs update to peers,
+    /// and request persistence. Returns the encoded update when the closure
+    /// reports that it changed the document.
+    pub async fn transact_and_broadcast<F>(
+        &self,
+        f: F,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnOnce(&mut TransactionMut) -> usize + Send,
+    {
+        let update = {
+            let doc = self.doc.lock().unwrap_or_else(|e| {
+                tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
+                e.into_inner()
+            });
+            let before = {
+                let txn = doc.transact();
+                txn.state_vector()
+            };
+
+            let changed = {
+                let mut txn = doc.transact_mut();
+                f(&mut txn)
+            };
+
+            if changed == 0 {
+                None
+            } else {
+                let txn = doc.transact();
+                Some(txn.encode_state_as_update_v1(&before))
+            }
+        };
+
+        if let Some(update) = update {
+            self.broadcast_sync_update(&update);
+            self.schedule_update_hook().await;
+            self.request_persist().await;
+            Ok(Some(update))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Return the full current document state encoded as a Yjs update.
+    pub fn encode_state_as_update(&self) -> Vec<u8> {
+        let doc = self.doc.lock().unwrap_or_else(|e| {
+            tracing::warn!("Doc mutex was poisoned for '{}', recovering", self.doc_name);
+            e.into_inner()
+        });
+        let txn = doc.transact();
+        txn.encode_state_as_update_v1(&StateVector::default())
+    }
+
     fn run_update_hook_for(
         doc_name: &str,
         doc: &StdArc<StdMutex<Doc>>,
-        hook: &UpdateHook,
+        hook: &NamedUpdateHook,
     ) -> Option<Vec<u8>> {
         let started = std::time::Instant::now();
         let doc = doc.lock().unwrap_or_else(|e| {
@@ -516,7 +593,7 @@ impl DocHandler {
 
         let repaired = {
             let mut txn = doc.transact_mut();
-            hook(&mut txn)
+            hook(doc_name, &mut txn)
         };
 
         if repaired == 0 {

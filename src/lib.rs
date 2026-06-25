@@ -9,7 +9,9 @@ pub mod sync;
 
 #[cfg(feature = "sqlite")]
 pub use db::Database;
-pub use sync::{DocHandler, UpdateHook, MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC};
+pub use sync::{
+    DocHandler, NamedUpdateHook, UpdateHook, MSG_AUTH, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC,
+};
 
 #[cfg(feature = "server")]
 use axum::{
@@ -37,7 +39,7 @@ pub struct AppState {
     pub rooms: DashMap<String, Arc<DocHandler>>,
     #[cfg(feature = "sqlite")]
     pub db: Database,
-    update_hook: Option<UpdateHook>,
+    update_hook: Option<NamedUpdateHook>,
 }
 
 #[cfg(feature = "server")]
@@ -49,6 +51,11 @@ impl AppState {
 
     #[cfg(feature = "sqlite")]
     pub fn new_with_update_hook(db: Database, update_hook: Option<UpdateHook>) -> Self {
+        Self::new_with_named_update_hook(db, update_hook.map(sync::named_update_hook))
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub fn new_with_named_update_hook(db: Database, update_hook: Option<NamedUpdateHook>) -> Self {
         Self {
             rooms: DashMap::new(),
             db,
@@ -63,6 +70,11 @@ impl AppState {
 
     #[cfg(not(feature = "sqlite"))]
     pub fn new_with_update_hook(update_hook: Option<UpdateHook>) -> Self {
+        Self::new_with_named_update_hook(update_hook.map(sync::named_update_hook))
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    pub fn new_with_named_update_hook(update_hook: Option<NamedUpdateHook>) -> Self {
         Self {
             rooms: DashMap::new(),
             update_hook,
@@ -81,7 +93,9 @@ impl AppState {
                     let update_hook = self.update_hook.clone();
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            Arc::new(DocHandler::new_with_update_hook(name, db, update_hook).await)
+                            Arc::new(
+                                DocHandler::new_with_named_update_hook(name, db, update_hook).await,
+                            )
                         })
                     })
                 }
@@ -90,7 +104,9 @@ impl AppState {
                     let update_hook = self.update_hook.clone();
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            Arc::new(DocHandler::new_with_update_hook(name, update_hook).await)
+                            Arc::new(
+                                DocHandler::new_with_named_update_hook(name, update_hook).await,
+                            )
                         })
                     })
                 }
